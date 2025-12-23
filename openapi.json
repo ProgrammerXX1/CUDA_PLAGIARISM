@@ -1,0 +1,34 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Hello Service", "version": "0.1.0" },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Hello",
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": {} } }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": {} } }
+        }
+      }
+    },
+    "/echo": {
+      "post": {
+        "summary": "Echo",
+        "requestBody": {
+          "required": true,
+          "content": { "text/plain": {} }
+        },
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": {} } }
+        }
+      }
+    }
+  }
+}
