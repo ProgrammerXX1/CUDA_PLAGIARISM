@@ -5,8 +5,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <optional>
 #include <filesystem>
+#include <chrono>
 
 #include <dlfcn.h>
 #include <pqxx/pqxx>
@@ -17,7 +17,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// ---------------- env helpers ----------------
+// ---------------- env ----------------
 static std::string env_or(const char* k, const std::string& defv) {
     const char* v = std::getenv(k);
     return (v && *v) ? std::string(v) : defv;
@@ -27,214 +27,161 @@ static std::string env_req(const char* k) {
     if (!v || !*v) throw std::runtime_error(std::string("missing env: ") + k);
     return std::string(v);
 }
+static std::string pg_conninfo_from_env() {
+    std::ostringstream ss;
+    ss << "host=" << env_req("PG_HOST")
+       << " port=" << env_or("PG_PORT", "5432")
+       << " dbname=" << env_req("PG_DB")
+       << " user=" << env_req("PG_USER")
+       << " password=" << env_req("PG_PASS");
+    return ss.str();
+}
 
 // ---------------- util ----------------
-static std::string read_file_or_empty(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return {};
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+static json parse_json_body(const httplib::Request& req) {
+    if (req.body.empty()) return json::object();
+    return json::parse(req.body);
+}
+static std::string now_version_tag() {
+    using namespace std::chrono;
+    auto t = system_clock::now();
+    auto s = duration_cast<seconds>(t.time_since_epoch()).count();
+    return "v" + std::to_string(s);
 }
 
-static bool ends_with(const std::string& s, const char* suf) {
-    size_t n = s.size(), m = std::strlen(suf);
-    if (m > n) return false;
-    return std::memcmp(s.data() + (n - m), suf, m) == 0;
-}
+// ---------------- DB ops ----------------
+// upsert doc by doc_id
+static json db_upsert_doc(const json& body) {
+    const std::string doc_id = body.value("doc_id", "");
+    const std::string text   = body.value("text", "");
+    const std::string title  = body.value("title", "");
+    const std::string author = body.value("author", "");
+    json meta = body.value("meta", json::object());
 
-// Упрощённый extract: читаем как UTF-8 текст только .txt
-static std::optional<std::string> extract_text_best_effort(const fs::path& file_path) {
-    const std::string p = file_path.string();
-    if (!ends_with(p, ".txt")) {
-        return std::nullopt; // позже сюда подключим нормальный PDF/DOCX extract
-    }
-    std::string body = read_file_or_empty(file_path);
-    if (body.empty()) return std::nullopt;
-    return body;
-}
+    if (doc_id.empty()) throw std::runtime_error("doc_id is required");
+    if (text.empty()) throw std::runtime_error("text is required");
 
-// ---------------- Postgres: rebuild corpus ----------------
-struct DocRow {
-    int id;
-    std::string external_id;
-    std::string title;
-    std::string student_name;
-};
-
-static std::string pg_conninfo_from_env() {
-    // PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASS
-    std::string host = env_req("PG_HOST");
-    std::string port = env_or("PG_PORT", "5432");
-    std::string db   = env_req("PG_DB");
-    std::string user = env_req("PG_USER");
-    std::string pass = env_req("PG_PASS");
-
-    std::ostringstream ss;
-    ss << "host=" << host
-       << " port=" << port
-       << " dbname=" << db
-       << " user=" << user
-       << " password=" << pass;
-    return ss.str();
-}
-
-static std::vector<DocRow> fetch_docs_l5_uploaded(
-    pqxx::connection& c,
-    const std::vector<int>& only_doc_ids
-) {
+    pqxx::connection c(pg_conninfo_from_env());
     pqxx::work tx(c);
 
-    std::vector<DocRow> out;
-
-    if (only_doc_ids.empty()) {
-        auto r = tx.exec(
-            "SELECT id, COALESCE(external_id,''), COALESCE(title,''), COALESCE(student_name,'') "
-            "FROM document WHERE status='l5_uploaded'"
-        );
-        out.reserve(r.size());
-        for (auto row : r) {
-            DocRow d;
-            d.id = row[0].as<int>();
-            d.external_id = row[1].as<std::string>();
-            d.title = row[2].as<std::string>();
-            d.student_name = row[3].as<std::string>();
-            out.push_back(std::move(d));
-        }
-    } else {
-        // простая сборка IN (...) (для MVP)
-        std::ostringstream in;
-        for (size_t i = 0; i < only_doc_ids.size(); ++i) {
-            if (i) in << ",";
-            in << only_doc_ids[i];
-        }
-
-        std::string q =
-            "SELECT id, COALESCE(external_id,''), COALESCE(title,''), COALESCE(student_name,'') "
-            "FROM document WHERE status='l5_uploaded' AND id IN (" + in.str() + ")";
-
-        auto r = tx.exec(q);
-        out.reserve(r.size());
-        for (auto row : r) {
-            DocRow d;
-            d.id = row[0].as<int>();
-            d.external_id = row[1].as<std::string>();
-            d.title = row[2].as<std::string>();
-            d.student_name = row[3].as<std::string>();
-            out.push_back(std::move(d));
-        }
-    }
+    // parameterized to avoid injection
+    tx.exec_params(
+        "INSERT INTO core_documents (doc_id, title, author, text_content, meta_json, status) "
+        "VALUES ($1,$2,$3,$4,$5::jsonb,'stored') "
+        "ON CONFLICT (doc_id) DO UPDATE SET "
+        "  title=EXCLUDED.title, "
+        "  author=EXCLUDED.author, "
+        "  text_content=EXCLUDED.text_content, "
+        "  meta_json=EXCLUDED.meta_json, "
+        "  status='stored'",
+        doc_id, title, author, text, meta.dump()
+    );
 
     tx.commit();
-    return out;
+
+    return json{{"ok", true}, {"doc_id", doc_id}};
 }
 
-static json rebuild_l5_corpus_cpp(const json& body) {
-    // env:
-    // UPLOAD_DIR=/path/to/uploads
-    // CORPUS_JSONL=/path/to/corpus.jsonl
-    const fs::path upload_dir = env_req("UPLOAD_DIR");
+// build corpus.jsonl from DB
+static json db_build_corpus(const json& body) {
     fs::path corpus_path = env_req("CORPUS_JSONL");
-
-    std::vector<int> only_ids;
-    if (body.contains("only_doc_ids") && body["only_doc_ids"].is_array()) {
-        for (auto& x : body["only_doc_ids"]) only_ids.push_back(x.get<int>());
-    }
     if (body.contains("corpus_path") && body["corpus_path"].is_string()) {
         corpus_path = body["corpus_path"].get<std::string>();
     }
-
-    pqxx::connection c(pg_conninfo_from_env());
-    auto docs = fetch_docs_l5_uploaded(c, only_ids);
-
-    if (docs.empty()) {
-        return json{{"docs_total", 0}, {"corpus_docs", 0}, {"corpus_path", corpus_path.string()}};
-    }
-
     fs::create_directories(corpus_path.parent_path());
 
-    int written = 0;
-    int skipped_no_external = 0;
-    int skipped_no_file = 0;
-    int skipped_no_text = 0;
+    pqxx::connection c(pg_conninfo_from_env());
+    pqxx::work tx(c);
+
+    // берём stored + indexed (можно только stored)
+    auto r = tx.exec(
+        "SELECT doc_id, COALESCE(title,''), COALESCE(author,''), text_content "
+        "FROM core_documents "
+        "WHERE status IN ('stored','indexed') "
+        "ORDER BY id"
+    );
 
     std::ofstream out(corpus_path, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write corpus: " + corpus_path.string());
 
-    for (const auto& d : docs) {
-        if (d.external_id.empty()) { skipped_no_external++; continue; }
+    int written = 0;
+    for (auto row : r) {
+        const std::string doc_id = row[0].as<std::string>();
+        const std::string title  = row[1].as<std::string>();
+        const std::string author = row[2].as<std::string>();
+        const std::string text   = row[3].as<std::string>();
 
-        fs::path file_path = upload_dir / d.external_id;
-        if (!fs::exists(file_path)) { skipped_no_file++; continue; }
+        if (doc_id.empty() || text.empty()) continue;
 
-        auto maybe_text = extract_text_best_effort(file_path);
-        if (!maybe_text.has_value() || maybe_text->empty()) { skipped_no_text++; continue; }
-
-        // ВАЖНО: doc_id должен быть тем, что тебе нужно видеть в поиске.
-        // Сейчас ставим doc_id = external_id (обычно это внешний document_id).
         json rec{
-            {"doc_id", d.external_id},
-            {"text", *maybe_text},
-            {"title", d.title},
-            {"author", d.student_name}
+            {"doc_id", doc_id},
+            {"text", text},
+            {"title", title},
+            {"author", author}
         };
         out << rec.dump() << "\n";
         written++;
     }
 
-    return json{
-        {"docs_total", (int)docs.size()},
-        {"corpus_docs", written},
-        {"corpus_path", corpus_path.string()},
-        {"skipped_no_external", skipped_no_external},
-        {"skipped_no_file", skipped_no_file},
-        {"skipped_no_text", skipped_no_text}
-    };
+    tx.commit();
+
+    return json{{"ok", true}, {"corpus_path", corpus_path.string()}, {"corpus_docs", written}};
 }
 
-// ---------------- index build: run index_builder ----------------
-static fs::path find_index_builder() {
-    // можно задать INDEX_BUILDER_PATH
-    const std::string envp = env_or("INDEX_BUILDER_PATH", "");
-    if (!envp.empty() && fs::exists(envp)) return fs::path(envp);
+// ---------------- index_builder runner ----------------
+static json run_index_builder(const json& body) {
+    fs::path corpus_path = env_req("CORPUS_JSONL");
+    if (body.contains("corpus_path")) corpus_path = body["corpus_path"].get<std::string>();
 
-    std::vector<fs::path> candidates = {
-        "/usr/local/bin/index_builder",
-        fs::current_path() / "index_builder",
-        fs::current_path() / "build" / "index_builder",
-    };
-    for (auto& p : candidates) if (fs::exists(p)) return p;
-    throw std::runtime_error("index_builder not found (set INDEX_BUILDER_PATH)");
-}
+    fs::path index_root = env_req("INDEX_ROOT");
+    std::string version = body.value("version", "");
+    if (version.empty()) version = now_version_tag();
 
-static json build_index_cpp(const json& body) {
-    fs::path corpus = env_req("CORPUS_JSONL");
-    fs::path index_dir = env_req("INDEX_DIR");
-
-    if (body.contains("corpus_path")) corpus = body["corpus_path"].get<std::string>();
-    if (body.contains("index_dir")) index_dir = body["index_dir"].get<std::string>();
-
-    if (!fs::exists(corpus)) throw std::runtime_error("corpus not found: " + corpus.string());
+    fs::path index_dir = index_root / version;
     fs::create_directories(index_dir);
 
-    fs::path bin = find_index_builder();
+    const fs::path bin = env_req("INDEX_BUILDER_PATH");
+    if (!fs::exists(bin)) throw std::runtime_error("INDEX_BUILDER_PATH not found: " + bin.string());
+    if (!fs::exists(corpus_path)) throw std::runtime_error("corpus not found: " + corpus_path.string());
+
+    // logs
+    fs::path outlog = index_dir / "build.stdout.log";
+    fs::path errlog = index_dir / "build.stderr.log";
 
     std::ostringstream cmd;
-    cmd << bin.string() << " " << corpus.string() << " " << index_dir.string()
-        << " > " << (index_dir / "build.stdout.log").string()
-        << " 2> " << (index_dir / "build.stderr.log").string();
+    cmd << bin.string() << " " << corpus_path.string() << " " << index_dir.string()
+        << " > " << outlog.string()
+        << " 2> " << errlog.string();
 
     int rc = std::system(cmd.str().c_str());
+
+    // save version in DB
+    pqxx::connection c(pg_conninfo_from_env());
+    pqxx::work tx(c);
+    tx.exec_params(
+        "INSERT INTO core_index_versions (version, index_dir, corpus_path, status, stats_json) "
+        "VALUES ($1,$2,$3,$4,$5::jsonb) "
+        "ON CONFLICT (version) DO UPDATE SET "
+        "  index_dir=EXCLUDED.index_dir, corpus_path=EXCLUDED.corpus_path, status=EXCLUDED.status, stats_json=EXCLUDED.stats_json",
+        version,
+        index_dir.string(),
+        corpus_path.string(),
+        (rc == 0 ? "built" : "failed"),
+        json{{"rc", rc}}.dump()
+    );
+    tx.commit();
+
     return json{
+        {"ok", rc == 0},
         {"rc", rc},
-        {"corpus_path", corpus.string()},
+        {"version", version},
         {"index_dir", index_dir.string()},
-        {"stdout_log", (index_dir / "build.stdout.log").string()},
-        {"stderr_log", (index_dir / "build.stderr.log").string()}
+        {"stdout_log", outlog.string()},
+        {"stderr_log", errlog.string()}
     };
 }
 
-// ---------------- searchcore.so: load + search ----------------
+// ---------------- libsearchcore.so bindings ----------------
 struct SeHit {
     int    doc_id_int;
     double score;
@@ -253,49 +200,66 @@ static void* g_lib = nullptr;
 static fn_se_load_index  g_load = nullptr;
 static fn_se_search_text g_search = nullptr;
 
-static bool g_index_loaded = false;
+static bool g_loaded = false;
 static fs::path g_current_index_dir;
-static std::vector<std::string> g_doc_ids;  // index_native_docids.json
+static std::vector<std::string> g_doc_ids;
 
-static void ensure_lib_loaded() {
+static std::string read_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    std::ostringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+
+static void ensure_core_loaded() {
     if (g_lib) return;
 
-    // LIBSEARCHCORE_PATH=/usr/local/lib/libsearchcore.so
     const std::string so = env_req("LIBSEARCHCORE_PATH");
     g_lib = dlopen(so.c_str(), RTLD_NOW);
     if (!g_lib) throw std::runtime_error(std::string("dlopen failed: ") + dlerror());
 
     g_load = (fn_se_load_index)dlsym(g_lib, "se_load_index");
     g_search = (fn_se_search_text)dlsym(g_lib, "se_search_text");
-    if (!g_load || !g_search) throw std::runtime_error("dlsym failed: missing symbols");
+    if (!g_load || !g_search) throw std::runtime_error("dlsym failed: missing se_load_index/se_search_text");
 }
 
-static void load_doc_ids_json(const fs::path& index_dir) {
-    auto p = index_dir / "index_native_docids.json";
-    std::string s = read_file_or_empty(p);
-    if (s.empty()) throw std::runtime_error("missing docids: " + p.string());
+static void load_docids(const fs::path& index_dir) {
+    fs::path p = index_dir / "index_native_docids.json";
+    std::string s = read_file(p);
+    if (s.empty()) throw std::runtime_error("missing index_native_docids.json in " + index_dir.string());
     g_doc_ids = json::parse(s).get<std::vector<std::string>>();
 }
 
 static json api_index_load(const json& body) {
-    ensure_lib_loaded();
+    ensure_core_loaded();
 
-    fs::path index_dir = env_req("INDEX_DIR");
-    if (body.contains("index_dir")) index_dir = body["index_dir"].get<std::string>();
+    fs::path index_dir;
+    if (body.contains("index_dir")) {
+        index_dir = body["index_dir"].get<std::string>();
+    } else {
+        // если не передали — берём current из БД
+        pqxx::connection c(pg_conninfo_from_env());
+        pqxx::work tx(c);
+        auto r = tx.exec("SELECT COALESCE(current_index_dir,'') FROM core_runtime_state WHERE id=1");
+        std::string cur = (r.size() ? r[0][0].as<std::string>() : "");
+        tx.commit();
+        if (cur.empty()) throw std::runtime_error("no current_index_dir in core_runtime_state, call /v1/index/set_current");
+        index_dir = cur;
+    }
 
     int rc = g_load(index_dir.string().c_str());
     if (rc != 0) throw std::runtime_error("se_load_index failed rc=" + std::to_string(rc));
 
-    load_doc_ids_json(index_dir);
+    load_docids(index_dir);
 
     g_current_index_dir = index_dir;
-    g_index_loaded = true;
+    g_loaded = true;
 
     return json{{"ok", true}, {"index_dir", index_dir.string()}, {"doc_ids", (int)g_doc_ids.size()}};
 }
 
 static json api_search(const json& body) {
-    if (!g_index_loaded) throw std::runtime_error("index not loaded");
+    if (!g_loaded) throw std::runtime_error("index not loaded");
 
     std::string q = body.value("q", "");
     int top = body.value("top", 10);
@@ -326,12 +290,26 @@ static json api_search(const json& body) {
     return json{{"hits_total", (int)docs.size()}, {"documents", docs}};
 }
 
-// ---------------- HTTP server ----------------
-static json parse_json_body(const httplib::Request& req) {
-    if (req.body.empty()) return json::object();
-    return json::parse(req.body);
+// set current index dir in DB (atomic pointer)
+static json api_set_current(const json& body) {
+    const std::string index_dir = body.value("index_dir", "");
+    const std::string version   = body.value("version", "");
+
+    if (index_dir.empty()) throw std::runtime_error("index_dir required");
+    if (!fs::exists(index_dir)) throw std::runtime_error("index_dir does not exist: " + index_dir);
+
+    pqxx::connection c(pg_conninfo_from_env());
+    pqxx::work tx(c);
+    tx.exec_params(
+        "UPDATE core_runtime_state SET current_version=$1, current_index_dir=$2 WHERE id=1",
+        version, index_dir
+    );
+    tx.commit();
+
+    return json{{"ok", true}, {"current_version", version}, {"current_index_dir", index_dir}};
 }
 
+// ---------------- HTTP ----------------
 int main() {
     httplib::Server svr;
 
@@ -347,22 +325,50 @@ int main() {
         res.set_content(json{{"ok", false}, {"error", msg}}.dump(), "application/json; charset=utf-8");
     };
 
-    svr.Post("/v1/l5/corpus/rebuild", [&](const httplib::Request& req, httplib::Response& res) {
-        try { ok(res, rebuild_l5_corpus_cpp(parse_json_body(req))); }
+    // 1) ingest text
+    svr.Post("/v1/docs/upsert", [&](const httplib::Request& req, httplib::Response& res) {
+        try { ok(res, db_upsert_doc(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    svr.Post("/v1/l5/index/build", [&](const httplib::Request& req, httplib::Response& res) {
-        try { ok(res, build_index_cpp(parse_json_body(req))); }
+    // 2) build corpus from DB
+    svr.Post("/v1/corpus/build", [&](const httplib::Request& req, httplib::Response& res) {
+        try { ok(res, db_build_corpus(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    svr.Post("/v1/l5/index/load", [&](const httplib::Request& req, httplib::Response& res) {
+    // 3) build index from corpus
+    svr.Post("/v1/index/build", [&](const httplib::Request& req, httplib::Response& res) {
+        try { ok(res, run_index_builder(parse_json_body(req))); }
+        catch (const std::exception& e) { fail(res, e.what()); }
+    });
+
+    // 3.5) convenience: rebuild = corpus + build index
+    svr.Post("/v1/index/rebuild", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            json body = parse_json_body(req);
+            json c = db_build_corpus(body);
+            json b = run_index_builder(body);
+            ok(res, json{{"ok", true}, {"corpus", c}, {"build", b}});
+        } catch (const std::exception& e) {
+            fail(res, e.what());
+        }
+    });
+
+    // 4) set current index dir in DB
+    svr.Post("/v1/index/set_current", [&](const httplib::Request& req, httplib::Response& res) {
+        try { ok(res, api_set_current(parse_json_body(req))); }
+        catch (const std::exception& e) { fail(res, e.what()); }
+    });
+
+    // 5) load current (or explicit) index into memory
+    svr.Post("/v1/index/load", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, api_index_load(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    svr.Post("/v1/l5/search", [&](const httplib::Request& req, httplib::Response& res) {
+    // 6) search
+    svr.Post("/v1/search", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, api_search(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
