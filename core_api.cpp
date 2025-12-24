@@ -1,5 +1,4 @@
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -50,7 +49,6 @@ static std::string now_version_tag() {
 }
 
 // ---------------- DB ops ----------------
-// upsert doc by doc_id
 static json db_upsert_doc(const json& body) {
     const std::string doc_id = body.value("doc_id", "");
     const std::string text   = body.value("text", "");
@@ -64,7 +62,6 @@ static json db_upsert_doc(const json& body) {
     pqxx::connection c(pg_conninfo_from_env());
     pqxx::work tx(c);
 
-    // parameterized to avoid injection
     tx.exec_params(
         "INSERT INTO core_documents (doc_id, title, author, text_content, meta_json, status) "
         "VALUES ($1,$2,$3,$4,$5::jsonb,'stored') "
@@ -78,11 +75,9 @@ static json db_upsert_doc(const json& body) {
     );
 
     tx.commit();
-
     return json{{"ok", true}, {"doc_id", doc_id}};
 }
 
-// build corpus.jsonl from DB
 static json db_build_corpus(const json& body) {
     fs::path corpus_path = env_req("CORPUS_JSONL");
     if (body.contains("corpus_path") && body["corpus_path"].is_string()) {
@@ -93,7 +88,6 @@ static json db_build_corpus(const json& body) {
     pqxx::connection c(pg_conninfo_from_env());
     pqxx::work tx(c);
 
-    // берём stored + indexed (можно только stored)
     auto r = tx.exec(
         "SELECT doc_id, COALESCE(title,''), COALESCE(author,''), text_content "
         "FROM core_documents "
@@ -124,7 +118,6 @@ static json db_build_corpus(const json& body) {
     }
 
     tx.commit();
-
     return json{{"ok", true}, {"corpus_path", corpus_path.string()}, {"corpus_docs", written}};
 }
 
@@ -144,7 +137,6 @@ static json run_index_builder(const json& body) {
     if (!fs::exists(bin)) throw std::runtime_error("INDEX_BUILDER_PATH not found: " + bin.string());
     if (!fs::exists(corpus_path)) throw std::runtime_error("corpus not found: " + corpus_path.string());
 
-    // logs
     fs::path outlog = index_dir / "build.stdout.log";
     fs::path errlog = index_dir / "build.stderr.log";
 
@@ -155,7 +147,6 @@ static json run_index_builder(const json& body) {
 
     int rc = std::system(cmd.str().c_str());
 
-    // save version in DB
     pqxx::connection c(pg_conninfo_from_env());
     pqxx::work tx(c);
     tx.exec_params(
@@ -218,9 +209,10 @@ static void ensure_core_loaded() {
     g_lib = dlopen(so.c_str(), RTLD_NOW);
     if (!g_lib) throw std::runtime_error(std::string("dlopen failed: ") + dlerror());
 
-    g_load = (fn_se_load_index)dlsym(g_lib, "se_load_index");
+    g_load   = (fn_se_load_index)dlsym(g_lib, "se_load_index");
     g_search = (fn_se_search_text)dlsym(g_lib, "se_search_text");
-    if (!g_load || !g_search) throw std::runtime_error("dlsym failed: missing se_load_index/se_search_text");
+    if (!g_load || !g_search)
+        throw std::runtime_error("dlsym failed: missing se_load_index/se_search_text");
 }
 
 static void load_docids(const fs::path& index_dir) {
@@ -237,7 +229,6 @@ static json api_index_load(const json& body) {
     if (body.contains("index_dir")) {
         index_dir = body["index_dir"].get<std::string>();
     } else {
-        // если не передали — берём current из БД
         pqxx::connection c(pg_conninfo_from_env());
         pqxx::work tx(c);
         auto r = tx.exec("SELECT COALESCE(current_index_dir,'') FROM core_runtime_state WHERE id=1");
@@ -290,7 +281,6 @@ static json api_search(const json& body) {
     return json{{"hits_total", (int)docs.size()}, {"documents", docs}};
 }
 
-// set current index dir in DB (atomic pointer)
 static json api_set_current(const json& body) {
     const std::string index_dir = body.value("index_dir", "");
     const std::string version   = body.value("version", "");
@@ -325,25 +315,21 @@ int main() {
         res.set_content(json{{"ok", false}, {"error", msg}}.dump(), "application/json; charset=utf-8");
     };
 
-    // 1) ingest text
     svr.Post("/v1/docs/upsert", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, db_upsert_doc(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    // 2) build corpus from DB
     svr.Post("/v1/corpus/build", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, db_build_corpus(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    // 3) build index from corpus
     svr.Post("/v1/index/build", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, run_index_builder(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    // 3.5) convenience: rebuild = corpus + build index
     svr.Post("/v1/index/rebuild", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             json body = parse_json_body(req);
@@ -355,19 +341,16 @@ int main() {
         }
     });
 
-    // 4) set current index dir in DB
     svr.Post("/v1/index/set_current", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, api_set_current(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    // 5) load current (or explicit) index into memory
     svr.Post("/v1/index/load", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, api_index_load(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
     });
 
-    // 6) search
     svr.Post("/v1/search", [&](const httplib::Request& req, httplib::Response& res) {
         try { ok(res, api_search(parse_json_body(req))); }
         catch (const std::exception& e) { fail(res, e.what()); }
